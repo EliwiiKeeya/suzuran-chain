@@ -42,7 +42,7 @@ class MCPScaffold:
         注册：
         1. LLM 角色
         2. MCP 客户端接口角色
-        3. 注册 LLM 和 RAG 消息处理器
+        3. 注册 Agent 消息处理器
         """
         logger.info("=" * 60)
         logger.info("搭建 MCP 脚手架...")
@@ -305,77 +305,6 @@ class MCPClientAdapter(Adapter):
         return message.payload.raw_content
 
 
-async def handle_rag_message(message: MCPMessage) -> MCPMessage:
-    """
-    RAG 消息处理器
-    """
-    from .protocol import MessageSource, MessageTarget, MessagePayload, Resource
-
-    logger = logging.getLogger(__name__)
-    logger.info(f"[RAG Handler] 收到消息: {message.payload}")
-    
-    # 从消息中提取查询 - 优先使用 extra 中的 query（来自 tool_calls）
-    query = message.payload.extra.get("query", message.payload.raw_content or "")
-    logger.info(f"[RAG Handler] 使用查询: {query}")
-    if not query:
-        logger.error("[RAG Handler] 未找到查询内容")
-        response = MCPMessage(
-            source=MessageSource(
-                role_id="rag:wiki",
-                role_type="rag"
-            ),
-            target=message.source,
-            payload=MessagePayload(raw_content="未找到查询内容")
-        )
-        return response
-    
-    # 获取 RAG 实例（使用全局 server 实例）
-    from .server import get_server
-    server = get_server()
-    rag = server.rag_instances.get("rag:wiki")
-    
-    if not rag:
-        logger.error("[RAG Handler] 未找到 RAG 实例")
-        response = MCPMessage(
-            source=MessageSource(
-                role_id="rag:wiki",
-                role_type="rag"
-            ),
-            target=message.source,
-            payload=MessagePayload(raw_content="RAG 未注册")
-        )
-        return response
-    
-    # 执行检索
-    content = await rag.retrieve(query)
-    
-    # 创建 Resource
-    resource = rag.create_resource(
-        server=server,
-        content=content,
-        metadata={"query": query}
-    )
-    
-    logger.info(f"[RAG Handler] 创建 Resource: {resource.uri}")
-    
-    # 创建响应消息，携带 Resource
-    response = MCPMessage(
-        source=MessageSource(
-            role_id="rag:wiki",
-            role_type="rag"
-        ),
-        target=message.source,
-        payload=MessagePayload(
-            resources=[resource]
-        )
-    )
-    
-    # 立即释放 Resource（免鉴权）
-    rag.release_resource(server, resource.uri)
-    
-    return response
-
-
 async def handle_llm_message(message: MCPMessage) -> MCPMessage:
     """
     LLM 消息处理器
@@ -383,7 +312,7 @@ async def handle_llm_message(message: MCPMessage) -> MCPMessage:
     设计说明：
     - 使用 Agent.handle() 处理消息
     - Agent 会自主判断是否调用 RAG Tool
-    - 本处理器仅负责消息转发和响应
+    - 本处理器负责消息转发、工具调用路由和响应
     """
     from .protocol import MessageSource, MessagePayload
     from suzuran_chain.llm.agent import get_agent
@@ -400,7 +329,6 @@ async def handle_llm_message(message: MCPMessage) -> MCPMessage:
         resource = message.payload.resources[0]
         logger.info(f"[LLM Handler] 收到 Resource: {resource.type}, content preview: {resource.content[:100]}...")
 
-    # 使用单例 Agent
     agent = get_agent()
     result = agent.handle(message.payload)
     
@@ -461,7 +389,6 @@ async def handle_llm_message(message: MCPMessage) -> MCPMessage:
             if rag_response.payload and rag_response.payload.resources:
                 logger.info(f"[LLM Handler] 收到 RAG 回调，包含 {len(rag_response.payload.resources)} 个 Resource")
                 
-                # 现在需要再次调用 server.process() 处理回调，让 Agent 接收 Resource
                 # 构造回调消息：source=rag, target=agent
                 callback_message = MCPMessage(
                     source=rag_response.source or MessageSource(role_id="rag:wiki", role_type="rag"),
@@ -469,11 +396,11 @@ async def handle_llm_message(message: MCPMessage) -> MCPMessage:
                     payload=rag_response.payload
                 )
                 
-                # 递归处理回调，这会让 Agent._handle_tool_call() 接收 Resource
+                # 递归处理回调，让 Agent 接收 Resource
                 final_response = await server.process(callback_message)
                 return final_response
             
-            # 没有 Resource，直接返回 RAG 响应（异常情况）
+            # 没有 Resource，直接返回 RAG 响应
             return rag_response
         else:
             response_content = str(result)
@@ -496,6 +423,77 @@ async def handle_llm_message(message: MCPMessage) -> MCPMessage:
             payload=MessagePayload(raw_content=response_content)
         )
 
+    return response
+
+
+async def handle_rag_message(message: MCPMessage) -> MCPMessage:
+    """
+    RAG 消息处理器
+    """
+    from .protocol import MessageSource, MessagePayload, Resource
+
+    logger = logging.getLogger(__name__)
+    logger.info(f"[RAG Handler] 收到消息: {message.payload}")
+    
+    # 从消息中提取查询 - 优先使用 extra 中的 query（来自 tool_calls）
+    query = message.payload.extra.get("query", message.payload.raw_content or "")
+    logger.info(f"[RAG Handler] 使用查询: {query}")
+    if not query:
+        logger.error("[RAG Handler] 未找到查询内容")
+        response = MCPMessage(
+            source=MessageSource(
+                role_id="rag:wiki",
+                role_type="rag"
+            ),
+            target=message.source,
+            payload=MessagePayload(raw_content="未找到查询内容")
+        )
+        return response
+    
+    # 获取 RAG 实例
+    from .server import get_server
+    server = get_server()
+    rag = server.rag_instances.get("rag:wiki")
+    
+    if not rag:
+        logger.error("[RAG Handler] 未找到 RAG 实例")
+        response = MCPMessage(
+            source=MessageSource(
+                role_id="rag:wiki",
+                role_type="rag"
+            ),
+            target=message.source,
+            payload=MessagePayload(raw_content="RAG 未注册")
+        )
+        return response
+    
+    # 执行检索
+    content = await rag.retrieve(query)
+    
+    # 创建 Resource
+    resource = rag.create_resource(
+        server=server,
+        content=content,
+        metadata={"query": query}
+    )
+    
+    logger.info(f"[RAG Handler] 创建 Resource: {resource.uri}")
+    
+    # 创建响应消息，携带 Resource
+    response = MCPMessage(
+        source=MessageSource(
+            role_id="rag:wiki",
+            role_type="rag"
+        ),
+        target=message.source,
+        payload=MessagePayload(
+            resources=[resource]
+        )
+    )
+    
+    # 立即释放 Resource
+    rag.release_resource(server, resource.uri)
+    
     return response
 
 
