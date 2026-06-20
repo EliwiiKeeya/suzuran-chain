@@ -100,13 +100,16 @@ class Agent(Role):
                 self.current_state = AgentState.TOOL_CALL
                 return self._handle_tool_call(context)
         
-        # 否则是正常的初始请求
+        # 正常的初始请求
+        # 如果之前处于 FINAL_RESPONSE 状态，说明是新对话，重置状态
+        if self.current_state == AgentState.FINAL_RESPONSE:
+            logger.info("Previous conversation ended, resetting to INITIAL state")
+            self.current_state = AgentState.INITIAL
+        
         if self.current_state == AgentState.INITIAL:
             return self._handle_initial(context)
         elif self.current_state == AgentState.TOOL_CALL:
             return self._handle_tool_call(context)
-        elif self.current_state == AgentState.FINAL_RESPONSE:
-            return self._handle_final_response(context)
         else:
             logger.warning(f"Unknown state: {self.current_state}, fallback to INITIAL")
             self.current_state = AgentState.INITIAL
